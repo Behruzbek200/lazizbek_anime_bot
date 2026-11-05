@@ -179,6 +179,7 @@ def role(uid):
 def isadmin(uid): return bool(role(uid))
 def can_manage(uid): return role(uid) in ('owner','super','moderator')
 def can_broadcast(uid): return role(uid) in ('owner','super','advertiser')
+def can_manage_channels(uid): return role(uid) in ('owner','super','moderator')
 def log_action(uid,action): db('INSERT INTO logs(user_id,action,created) VALUES(?,?,?)',(uid,action,now()))
 def ensure_user(u):
     if not u:return
@@ -234,16 +235,16 @@ def sub_missing(uid):
     if isadmin(uid) or setting('force_sub')!='1':return []
     missing=[]
     for ch in db('SELECT * FROM channels WHERE enabled=1',all=True):
+        # So‘rovli kanal: botga kelgan join request foydalanuvchiga darhol ruxsat beradi.
+        if ch['mode']=='request':
+            r=db('SELECT status FROM requests WHERE user_id=? AND channel_id=?',(uid,ch['id']),one=True)
+            if r and r['status']=='pending':continue
         try:
             m=bot.get_chat_member(ch['id'],uid)
             if m.status in ('creator','administrator','member') or (m.status=='restricted' and getattr(m,'is_member',False)):
                 continue
         except Exception as e:
             log.warning('Obuna tekshirib bo‘lmadi %s: %s',ch['id'],e)
-            missing.append(ch);continue
-        if ch['mode']=='request':
-            r=db('SELECT status FROM requests WHERE user_id=? AND channel_id=?',(uid,ch['id']),one=True)
-            if r and r['status']=='pending': continue
         missing.append(ch)
     return missing
 
@@ -430,7 +431,7 @@ def append_episode(aid, file_id, media_type, season=1):
 
 def admin_menu(uid):
     if not isadmin(uid):return
-    buttons=[[('🎬 Anime boshqaruvi','adm:anime'),('📺 Qismlar boshqaruvi','adm:episodes')], [('👥 Foydalanuvchilar','adm:users'),('📊 Statistika','adm:stats')], [('📢 Xabar yuborish','adm:broadcast'),('📡 Kanallar','adm:channels')], [('🛡 Adminlar','adm:admins'),('⚙️ Sozlamalar','adm:settings')], [('📋 Loglar','adm:logs'),('💾 Backup','adm:backup')]]
+    buttons=[[('🎬 Anime boshqaruvi','adm:anime'),('📺 Qismlar boshqaruvi','adm:episodes')], [('👥 Foydalanuvchilar','adm:users'),('📊 Statistika','adm:stats')], [('📢 Xabar yuborish','adm:broadcast'),('📡 Majburiy kanallar','adm:channels')], [('🛡 Adminlar','adm:admins'),('⚙️ Sozlamalar','adm:settings')], [('📋 Loglar','adm:logs'),('💾 Backup','adm:backup')]]
     buttons.append([('🏠 Asosiy menyu', 'menu:home')])
     send(uid,'👑 <b>ANIME UZ PRO | ADMIN PANEL</b>',kb(buttons))
 
@@ -440,13 +441,102 @@ def menu(uid,section):
       'episodes':[('🎞 Oddiy video biriktirish','act:quickcode'),('➕ Qism qo‘shish','act:addepisode'),('📤 Ommaviy yuklash','act:bulk'),('🗑 Qism o‘chirish','act:delepisode'),('📚 Qismlarni ko‘rish','act:epbrowse')],
       'users':[('🔎 ID orqali qidirish','act:finduser'),('🚫 Ban / unban','act:ban'),('📥 CSV userlar','act:userscsv')],
       'broadcast':[('👥 Hammaga yuborish','act:broadcast'),('📢 Anime e’loni','act:announce')],
-      'channels':[('➕ Kanal qo‘shish','act:addchannel'),('📚 Kanallar','act:channels'),('🔐 Majburiy obuna yoq/o‘chir','act:forcesub')],
+      'channels':[('➕ Majburiy kanal qo‘shish','act:addchannel'),('🗑 Majburiy kanalni o‘chirish','act:removechannel'),('📋 Kanallar ro‘yxati','act:channels'),('🔐 Obunani yoqish / o‘chirish','act:forcesub')],
       'admins':[('➕ Admin qo‘shish','act:addadmin'),('🗑 Admin o‘chirish','act:removeadmin'),('📚 Adminlar ro‘yxati','act:listadmins')],
       'settings':[('📝 Start matni','act:welcome'),('📞 Aloqa username','act:support'),('🔧 Texnik rejim','act:maintenance'),('🔔 Bildirishnoma','act:notify')]
     }
     if section=='admins' and role(uid)!='owner':send(uid,'Faqat OWNER.');return
+    if section=='channels' and not can_manage_channels(uid):
+        send(uid,'❌ Majburiy kanallarni boshqarish uchun admin huquqi kerak.');return
     items=menus.get(section,[])
-    send(uid,f'🛠 <b>{h(section.upper())}</b>',kb([[(lab,dat)] for lab,dat in items]+[[('🔙 Admin panel','adm:home')]]))
+    if section=='channels':
+        n=db('SELECT COUNT(*) n FROM channels',one=True)['n']
+        active=db('SELECT COUNT(*) n FROM channels WHERE enabled=1',one=True)['n']
+        is_on=setting('force_sub')=='1'
+        title=('📡 <b>MAJBURIY KANALLAR</b>\n\n'
+               f'📋 Jami: {n} ta | faol: {active} ta\n'
+               f'🔐 Majburiy obuna: {"✅ Yoqilgan" if is_on else "❌ O‘chirilgan"}\n\n'
+               'Kanal qo‘shish, o‘chirish va holatini o‘zgartirish uchun tugmani tanlang.')
+    else:
+        title=f'🛠 <b>{h(section.upper())}</b>'
+    send(uid,title,kb([[(lab,dat)] for lab,dat in items]+[[('🔙 Admin panel','adm:home')]]))
+
+def show_channels(uid, for_removal=False):
+    if not can_manage_channels(uid):
+        send(uid, '❌ Kanallarni boshqarish uchun admin huquqi kerak.')
+        return
+    rr=db('SELECT * FROM channels ORDER BY title COLLATE NOCASE, id',all=True)
+    if not rr:
+        send(uid,'📡 Hozircha majburiy kanal qo‘shilmagan.',
+             kb([[('➕ Kanal qo‘shish','act:addchannel')], [('🔙 Kanallar menyusi','adm:channels')]]))
+        return
+    send(uid, '🗑 <b>O‘chiriladigan kanalni tanlang:</b>' if for_removal
+         else '📋 <b>Majburiy kanallar ro‘yxati</b>\n\nHar bir kanalning holati va boshqaruv tugmalari quyida.')
+    for ch in rr:
+        status='✅ Faol' if ch['enabled'] else '❌ O‘chirilgan'
+        mode='📝 So‘rovli' if ch['mode']=='request' else '👥 Oddiy'
+        txt=(f"📡 <b>{h(ch['title'])}</b>\n"
+             f"🆔 <code>{ch['id']}</code>\n"
+             f"🔐 Turi: {mode} | {status}\n"
+             f"🔗 {h(ch['url'] or 'Havola yo‘q')}")
+        if for_removal:
+            buttons=[[('🗑 Shu kanalni o‘chirish',f'ad:channelaskdelete:{ch["id"]}')]]
+        else:
+            buttons=[[('🔁 Yoqish / o‘chirish',f'ad:channeltoggle:{ch["id"]}')],
+                     [('🗑 Kanalni o‘chirish',f'ad:channelaskdelete:{ch["id"]}')]]
+        send(uid,txt,kb(buttons))
+    send(uid,'📡 Kanal boshqaruviga qaytish:',kb([[('🔙 Kanallar menyusi','adm:channels')]]))
+
+
+def finish_channel_add(uid, mode):
+    if not can_manage_channels(uid):
+        return
+    st=getstate(uid)
+    if st.get('kind')!='admin:channel_mode' or mode not in ('normal', 'request'):
+        send(uid,'❌ Kanal qo‘shish bosqichi topilmadi. Menyudan qaytadan boshlang.')
+        return
+    channel_id=st['channel_id']
+    # Admin rights can change between the first and second step.
+    try:
+        me=bot.get_chat_member(channel_id, bot.get_me().id)
+        if me.status not in ('administrator','creator'):
+            send(uid,'❌ Bot kanal administratori emas. Kanalda admin qilib, qaytadan urinib ko‘ring.')
+            return
+        if mode=='request':
+            if not getattr(me,'can_invite_users',False):
+                send(uid,'❌ So‘rovli kanal uchun botda «Invite users / Taklif qilish» huquqi bo‘lishi shart.')
+                return
+            link=bot.create_chat_invite_link(channel_id,name='ANIMEUZ_REQUEST',creates_join_request=True).invite_link
+        else:
+            link=f'https://t.me/{st["username"]}' if st.get('username') else ''
+            if not link:
+                if not getattr(me, 'can_invite_users', False):
+                    send(uid,'❌ Xususiy kanalga havola yaratish uchun botga «Invite users» huquqini bering.')
+                    return
+                link=bot.create_chat_invite_link(channel_id,name='ANIMEUZ_JOIN').invite_link
+    except Exception as e:
+        log.warning('Kanal havolasini yaratib bo‘lmadi %s: %s', channel_id,e)
+        send(uid,'❌ Kanal havolasi yaratilmadi. Botning admin huquqlari va kanal ID qiymatini tekshiring.')
+        return
+    old=db('SELECT mode FROM channels WHERE id=?',(channel_id,),one=True)
+    # Type changes invalidate old request authorizations for this channel.
+    if old and old['mode']!=mode:
+        db('DELETE FROM requests WHERE channel_id=?',(channel_id,))
+    db('INSERT INTO channels(id,title,url,mode,enabled) VALUES(?,?,?,?,1) '
+       'ON CONFLICT(id) DO UPDATE SET title=excluded.title,url=excluded.url,mode=excluded.mode,enabled=1',
+       (channel_id,st['title'],link,mode))
+    clearstate(uid)
+    log_action(uid,f'Majburiy kanal qo‘shildi {channel_id} ({mode})')
+    send(uid,'✅ <b>MAJBURIY KANAL QO‘SHILDI!</b>\n\n'
+         f'📡 {h(st["title"])}\n'
+         f'🔐 Turi: {"So‘rovli" if mode=="request" else "Oddiy"}\n'
+         f'🔗 {h(link)}\n\n'
+         + ('✅ Foydalanuvchi so‘rov yuborganidan keyin botga kira oladi.' if mode=='request'
+            else '✅ Foydalanuvchi kanalga obuna bo‘lgach botga kira oladi.'),
+         kb([[('📋 Kanallar ro‘yxati','act:channels')],
+             [('➕ Yana kanal qo‘shish','act:addchannel')],
+             [('🔙 Kanallar menyusi','adm:channels')]]))
+
 
 def ask(uid,kind,text,**args):state(uid,kind,**args);send(uid,text+'\n\nBekor qilish: /cancel')
 
@@ -545,7 +635,7 @@ def messages(m):
         return
     if m.content_type!='text':return
     t=m.text.strip()
-    if t=='🛠 Admin panel' and isadmin(uid):admin_menu(uid);return
+    if t in ('🛠 Admin panel','👑 Admin panel') and isadmin(uid):admin_menu(uid);return
     if not gate(uid):return
     # Yangi interfeys inline, ammo foydalanuvchi eski tugmalarini bosgan bo'lsa ham ishlaydi.
     if t in ('🔎 Anime qidirish',):
@@ -654,10 +744,47 @@ def admin_callbacks(c,data):
         return
     if op=='ad':
         action=parts[1]
-        if action=='channeldelete' and role(uid) in ('owner','super'):
-            db('DELETE FROM channels WHERE id=?',(int(parts[2]),));db('DELETE FROM requests WHERE channel_id=?',(int(parts[2]),));send(uid,'✅ Kanal o‘chirildi.')
-        elif action=='channeltoggle' and role(uid) in ('owner','super'):
-            db('UPDATE channels SET enabled=1-enabled WHERE id=?',(int(parts[2]),));send(uid,'✅ Holat o‘zgartirildi.')
+        if action=='channelaskdelete' and can_manage_channels(uid):
+            channel_id=int(parts[2])
+            ch=db('SELECT * FROM channels WHERE id=?',(channel_id,),one=True)
+            if not ch:
+                send(uid,'❌ Kanal topilmadi.');return
+            send(uid, '⚠️ <b>MAJBURIY KANALNI O‘CHIRISH</b>\n\n'
+                 f'📡 {h(ch["title"])}\n'
+                 f'🆔 <code>{channel_id}</code>\n\n'
+                 'Bu kanal majburiy obuna ro‘yxatidan va unga tegishli so‘rov ma’lumotlari bazadan o‘chadi.\n'
+                 '<b>O‘chirishni tasdiqlaysizmi?</b>',
+                 kb([[('🗑 Ha, kanalni o‘chirish',f'ad:channeldelete:{channel_id}')],
+                     [('❌ Bekor qilish','ad:channelcancel')]]))
+        elif action=='channeldelete' and can_manage_channels(uid):
+            channel_id=int(parts[2])
+            with DB_LOCK:
+                con=sqlite3.connect(DB_PATH,timeout=30)
+                try:
+                    con.execute('BEGIN IMMEDIATE')
+                    deleted=con.execute('DELETE FROM channels WHERE id=?',(channel_id,)).rowcount
+                    con.execute('DELETE FROM requests WHERE channel_id=?',(channel_id,))
+                    con.commit()
+                except Exception:
+                    con.rollback();raise
+                finally:con.close()
+            if deleted:log_action(uid,f'Majburiy kanal o‘chirildi {channel_id}')
+            send(uid,'✅ Kanal majburiy obunadan butunlay o‘chirildi.' if deleted else '❌ Kanal allaqachon o‘chirilgan.',
+                 kb([[('📋 Qolgan kanallar','act:channels')], [('🔙 Kanallar menyusi','adm:channels')]]))
+        elif action=='channelcancel' and can_manage_channels(uid):
+            send(uid,'✅ Kanal o‘chirish bekor qilindi.',kb([[('📋 Kanallar','act:channels')]]))
+        elif action=='channelmode' and can_manage_channels(uid):
+            if len(parts)==3:finish_channel_add(uid,parts[2])
+        elif action=='channelmodecancel' and can_manage_channels(uid):
+            clearstate(uid);menu(uid,'channels')
+        elif action=='channeltoggle' and can_manage_channels(uid):
+            channel_id=int(parts[2])
+            db('UPDATE channels SET enabled=1-enabled WHERE id=?',(channel_id,))
+            ch=db('SELECT enabled,title FROM channels WHERE id=?',(channel_id,),one=True)
+            if ch:
+                send(uid,f"✅ {h(ch['title'])}: {'faol' if ch['enabled'] else 'o‘chirilgan'}.",
+                     kb([[('📋 Kanallar ro‘yxati','act:channels')]]))
+            else:send(uid,'❌ Kanal topilmadi.')
         elif action in ('animehide','animeremove') and can_manage(uid):
             delete_anime_confirmation(uid, int(parts[2]))
         elif action=='animeremoveconfirm' and can_manage(uid):
@@ -701,7 +828,8 @@ def admin_callbacks(c,data):
         return
     act=parts[1]
     if act in ('addanime','editanime','deleteanime','adminlist','addepisode','bulk','delepisode','epbrowse','announce','quickcode') and not can_manage(uid):return
-    if act in ('addchannel','forcesub','channels') and role(uid) not in ('owner','super'):return
+    if act in ('addchannel','removechannel','forcesub','channels') and not can_manage_channels(uid):
+        send(uid,'❌ Majburiy kanallarni boshqarish uchun admin huquqi kerak.');return
     if act in ('addadmin','removeadmin','listadmins') and role(uid)!='owner':return
     if act=='addanime':ask(uid,'admin:add_title','🎌 Anime nomini yozing:')
     elif act=='editanime':ask(uid,'admin:edit_code','✏️ Anime kodi yoki ID sini yuboring:')
@@ -722,14 +850,13 @@ def admin_callbacks(c,data):
     elif act=='broadcast':
         if can_broadcast(uid):ask(uid,'admin:broadcast','📢 Yuboriladigan xabar, rasm yoki videoni yuboring:')
     elif act=='announce':ask(uid,'admin:announce','🎬 E’lon qilinadigan anime kodini yuboring:')
-    elif act=='addchannel':ask(uid,'admin:channel_id','📡 Kanal ID sini (-100...) yoki @usernamesini yuboring. YOKI kanaldan bitta postni forward qiling (forward manbasi yashirilmagan bo‘lsin).\n\nXUSUSIY kanal uchun: botni administrator qiling, keyin ID yoki forward post yuboring.\nSo‘rovli kanalda botga «Add subscribers / Invite users» huquqini bering.')
-    elif act=='channels':
-        rr=db('SELECT * FROM channels',all=True)
-        for ch in rr:
-            send(uid,f"📡 {h(ch['title'])}\nID: <code>{ch['id']}</code>\nRejim: {ch['mode']}\nHolat: {'✅' if ch['enabled'] else '❌'}\n{h(ch['url'])}",kb([[('🔁 Faollik',f'ad:channeltoggle:{ch["id"]}'),('🗑 O‘chirish',f'ad:channeldelete:{ch["id"]}')]]))
-        if not rr:send(uid,'Kanal yo‘q.')
+    elif act=='addchannel':ask(uid,'admin:channel_id','📡 <b>Majburiy kanal qo‘shish</b>\n\n1️⃣ Botni kanalga <b>administrator</b> qilib qo‘shing.\n2️⃣ Kanalning <b>@username</b> yoki <b>-100...</b> ID raqamini yuboring. Kanal postini forward qilish ham mumkin (manbasi yashirilmagan bo‘lsa).\n3️⃣ Keyin «Oddiy» yoki «So‘rovli» tugmasini tanlaysiz.\n\n🔒 Xususiy kanal uchun @username emas, ID yoki forward kerak.\n✉️ So‘rovli kanal uchun botda «Invite users» huquqi zarur.')
+    elif act=='channels':show_channels(uid)
+    elif act=='removechannel':show_channels(uid,for_removal=True)
     elif act=='forcesub':
-        set_setting('force_sub','0' if setting('force_sub')=='1' else '1');send(uid,'🔐 Majburiy obuna: '+('ON' if setting('force_sub')=='1' else 'OFF'))
+        set_setting('force_sub','0' if setting('force_sub')=='1' else '1')
+        log_action(uid,'Majburiy obuna '+('yoqildi' if setting('force_sub')=='1' else 'o‘chirildi'))
+        menu(uid,'channels')
     elif act=='addadmin':ask(uid,'admin:addadmin','🛡 Yangi admin ID sini yuboring:')
     elif act=='removeadmin':ask(uid,'admin:removeadmin','🛡 O‘chiriladigan admin ID sini yuboring:')
     elif act=='listadmins':
@@ -844,26 +971,32 @@ def admin_input(m,st):
                 channel_hint=m.forward_from_chat.id
             if not channel_hint and not t:
                 send(uid,'Kanal ID / @username yozing yoki kanaldan bitta postni forward qiling.');return
-            chat=bot.get_chat(channel_hint or (int(t) if t.lstrip('-').isdigit() else t))
+            raw=t.strip()
+            if raw.startswith('https://t.me/') or raw.startswith('http://t.me/'):
+                raw=raw.rstrip('/').split('/')[-1]
+                if raw.startswith('+') or raw.startswith('joinchat'):
+                    send(uid,'❌ Xususiy kanalga taklif havolasi orqali qo‘shib bo‘lmaydi. Kanal ID (-100...) yoki forward post yuboring.');return
+                raw='@'+raw.lstrip('@')
+            chat=bot.get_chat(channel_hint or (int(raw) if raw.lstrip('-').isdigit() else raw))
+            if chat.type!='channel':
+                send(uid,'❌ Faqat Telegram kanallarini qo‘shish mumkin. Kanal ID yoki @username yuboring.');return
             me=bot.get_chat_member(chat.id,bot.get_me().id)
-            if me.status not in ('creator','administrator'):send(uid,'❌ Botni kanalga administrator qiling, keyin qayta urinib ko‘ring.');return
-            ask(uid,'admin:channel_mode',f"✅ Kanal: {h(chat.title)}\nRejim yozing: oddiy yoki sorov\n\nSo‘rovli rejimga can_invite_users huquqi kerak.",channel_id=chat.id,title=chat.title or t,username=chat.username or '');return
+            if me.status not in ('creator','administrator'):
+                send(uid,'❌ Botni kanalga administrator qiling, keyin qayta urinib ko‘ring.');return
+            state(uid,'admin:channel_mode',channel_id=chat.id,title=chat.title or raw,username=chat.username or '')
+            send(uid,f'✅ <b>{h(chat.title)}</b>\n\nKanal turini tanlang:\n\n'
+                 '👥 <b>Oddiy:</b> kanalga to‘liq obuna bo‘lish kerak.\n'
+                 '📝 <b>So‘rovli:</b> qo‘shilish so‘rovini yuborishi kifoya, admin tasdiqlashi shart emas.',
+                 kb([[('👥 Oddiy kanal','ad:channelmode:normal')],
+                     [('📝 So‘rovli kanal','ad:channelmode:request')],
+                     [('❌ Bekor qilish','ad:channelmodecancel')]]))
+            return
         if k=='admin:channel_mode':
-            if norm(t) not in ('oddiy','sorov',"so'rov",'request'):send(uid,'oddiy yoki sorov deb yozing.');return
-            mode='request' if norm(t)!='oddiy' else 'normal'
-            if mode=='request':
-                me=bot.get_chat_member(st['channel_id'],bot.get_me().id)
-                if not getattr(me,'can_invite_users',False):send(uid,'❌ So‘rovlarni olish uchun botga «Invite users» admin huquqini bering.');return
-                try:
-                    link=bot.create_chat_invite_link(st['channel_id'],name='ANIMEUZ_REQUEST',creates_join_request=True).invite_link
-                except Exception as e:send(uid,f'❌ So‘rov havolasi yaratilmadi: {h(e)}');return
-            else:
-                link=f'https://t.me/{st["username"]}' if st['username'] else ''
-                if not link:
-                    try:link=bot.create_chat_invite_link(st['channel_id'],name='ANIMEUZ_JOIN').invite_link
-                    except Exception:send(uid,'❌ Xususiy kanal uchun havola yaratish huquqini bering.');return
-            db('INSERT INTO channels(id,title,url,mode) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,url=excluded.url,mode=excluded.mode,enabled=1',(st['channel_id'],st['title'],link,mode))
-            clearstate(uid);log_action(uid,f'Kanal qo‘shildi {st["channel_id"]} {mode}');send(uid,'✅ Kanal qo‘shildi!\n'+h(link));return
+            if norm(t) in ('oddiy','normal'):
+                finish_channel_add(uid,'normal');return
+            if norm(t) in ('sorov',"so'rov",'request'):
+                finish_channel_add(uid,'request');return
+            send(uid,'👇 Quyidagi «Oddiy» yoki «So‘rovli» inline tugmasini tanlang.');return
         if k=='admin:finduser':
             u=db('SELECT * FROM users WHERE id=?',(int(t),),one=True)
             clearstate(uid)
@@ -886,7 +1019,7 @@ def admin_input(m,st):
         if k.startswith('admin:setting:'):
             field = k.split(':')[2]
             if field == 'support':
-                if role(uid) not in ('owner', 'super'):
+                if not can_manage_channels(uid):
                     clearstate(uid);send(uid, '❌ Bu sozlamani o‘zgartirishga ruxsat yo‘q.');return
                 username = parse_support_username(t)
                 if not username:
